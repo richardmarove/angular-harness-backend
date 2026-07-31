@@ -2,12 +2,14 @@ import type { Content, Part } from '@google/genai';
 import { getAI } from './gemini.js';
 import { TOOL_DECLARATIONS } from '../tools/index.js';
 import { executeTool } from '../tools/executor.js';
+import { createTurn, getTurn, saveTurnHistory, deleteTurn } from './turn-store.js';
 
 // ---------------------------------------------------------------------------
 // Event types — mirrored on the client side
 // ---------------------------------------------------------------------------
 
 export type AgentEvent =
+  | { type: 'turn'; turnId: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown> }
   | { type: 'tool_result'; name: string; result: string; error?: string }
   | { type: 'chunk'; text: string }
@@ -21,6 +23,7 @@ export interface RunOptions {
   messages: Array<{ role: 'user' | 'model'; content: string }>;
   workingDir: string;
   maxIterations?: number;
+  turnId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,10 +55,18 @@ Guidelines:
 export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEvent> {
   const { messages, workingDir, maxIterations = 20 } = options;
 
-  const history: Content[] = messages.map((m) => ({
-    role: m.role,
-    parts: [{ text: m.content }],
-  }));
+  const existing = options.turnId ? getTurn(options.turnId) : undefined;
+  const turnId: string = existing ? options.turnId! : createTurn(workingDir);
+
+  let history: Content[];
+  if (existing) {
+    history = existing.history; // resume where we left off
+  } else {
+    history = messages.map((m) => ({ role: m.role, parts: [{ text: m.content }] }));
+    saveTurnHistory(turnId, history);
+  }
+
+  yield { type: 'turn', turnId };
 
   const systemInstruction = SYSTEM_INSTRUCTION.replace('{WORKING_DIR}', workingDir);
   const model = process.env.GEMINI_MODEL ?? 'gemma-4-31b-it';
@@ -64,32 +75,27 @@ export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEv
     const response = await getAI().models.generateContent({
       model,
       contents: history,
-      config: {
-        systemInstruction,
-        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-      },
+      config: { systemInstruction, tools: [{ functionDeclarations: TOOL_DECLARATIONS }] },
     });
 
     const candidate = response.candidates?.[0];
     if (!candidate?.content) break;
 
     const parts: Part[] = candidate.content.parts ?? [];
-
-    // Append model's turn to history
     history.push({ role: 'model', parts });
+    saveTurnHistory(turnId, history); // checkpoint after every model turn
 
     const functionCallParts = parts.filter((p) => p.functionCall);
 
-    // --- No tool calls: stream final text and exit ---
     if (functionCallParts.length === 0) {
       for (const part of parts) {
         if (part.text) yield { type: 'chunk', text: part.text };
       }
+      deleteTurn(turnId); // finished cleanly — nothing left to resume
       yield { type: 'done' };
       return;
     }
 
-    // --- Execute each tool call ---
     const toolResultParts: Part[] = [];
 
     for (const part of functionCallParts) {
@@ -101,7 +107,6 @@ export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEv
 
       let result: string;
       let error: string | undefined;
-
       try {
         result = await executeTool(name, args, workingDir);
       } catch (err) {
@@ -110,20 +115,14 @@ export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEv
       }
 
       yield { type: 'tool_result', name, result, error };
-
-      toolResultParts.push({
-        functionResponse: {
-          name,
-          response: { output: result },
-        },
-      });
+      toolResultParts.push({ functionResponse: { name, response: { output: result } } });
     }
 
-    // Feed tool results back for the next model turn
     history.push({ role: 'user', parts: toolResultParts });
+    saveTurnHistory(turnId, history); // checkpoint after every tool batch
   }
 
-  // Safety net if we hit max iterations
+  deleteTurn(turnId);
   yield { type: 'chunk', text: '\n\n⚠️ Agent reached the maximum number of iterations.' };
   yield { type: 'done' };
 }

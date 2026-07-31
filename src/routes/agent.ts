@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { runAgentLoop } from '../services/agent-loop.js';
+import { normalizeAgentError } from '../utils/agent-errors.js';
 import fs from 'node:fs/promises';
 
 const agentRouter = new Hono();
@@ -9,9 +10,10 @@ agentRouter.post('/run', async (c) => {
   const body = await c.req.json<{
     messages: Array<{ role: 'user' | 'model'; content: string }>;
     workingDir: string;
+    turnId?: string;
   }>();
 
-  const { messages, workingDir } = body;
+  const { messages, workingDir, turnId } = body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return c.json({ error: 'messages array is required' }, 400);
@@ -29,19 +31,22 @@ agentRouter.post('/run', async (c) => {
 
   return streamSSE(c, async (stream) => {
     let id = 0;
+    let capturedTurnId: string | undefined;
 
     const write = (event: string, data: unknown) =>
       stream.writeSSE({ event, data: JSON.stringify(data), id: String(id++) });
 
     try {
-      for await (const event of runAgentLoop({ messages, workingDir })) {
+      for await (const event of runAgentLoop({ messages, workingDir, turnId })) {
         const { type, ...payload } = event;
+        if (type === 'turn') capturedTurnId = (event as any).turnId;
         await write(type, payload);
         if (stream.aborted) break;
       }
     } catch (err) {
       console.error('Agent run error:', err);
-      await write('error', { message: String(err) });
+      const normalized = normalizeAgentError(err);
+      await write('error', { ...normalized, turnId: capturedTurnId });
     }
   });
 });
