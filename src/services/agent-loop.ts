@@ -27,7 +27,7 @@ export interface RunOptions {
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_INSTRUCTION = `You are CodeAgent, an expert AI coding assistant with direct access to the user's file system and shell.
+const SYSTEM_INSTRUCTION = `You are angular-harness, an expert AI coding assistant with direct access to the user's file system and shell.
 
 Available tools:
 - read_file: Read any file in the working directory
