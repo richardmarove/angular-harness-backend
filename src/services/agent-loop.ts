@@ -12,6 +12,7 @@ export type AgentEvent =
   | { type: 'turn'; turnId: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown> }
   | { type: 'tool_result'; name: string; result: string; error?: string }
+  | { type: 'thought'; text: string }
   | { type: 'chunk'; text: string }
   | { type: 'done' };
 
@@ -88,12 +89,43 @@ export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEv
   const systemInstruction = SYSTEM_INSTRUCTION.replace('{WORKING_DIR}', workingDir);
   const model = process.env.GEMINI_MODEL ?? 'gemma-4-31b-it';
 
+  // Track whether thinkingConfig is supported for this model — once we learn
+  // it's rejected, stop trying on every subsequent iteration of this loop.
+  let thinkingSupported = true;
+
   for (let iteration = 0; iteration < maxIterations; iteration++) {
-    const response = await getAI().models.generateContent({
-      model,
-      contents: history,
-      config: { systemInstruction, tools: [{ functionDeclarations: TOOL_DECLARATIONS }] },
-    });
+    const baseConfig = {
+      systemInstruction,
+      tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+    };
+
+    let response;
+    if (thinkingSupported) {
+      try {
+        response = await getAI().models.generateContent({
+          model,
+          contents: history,
+          config: {
+            ...baseConfig,
+            thinkingConfig: { includeThoughts: true },
+          },
+        });
+      } catch (err) {
+        // If the SDK/model rejects thinkingConfig, fall back for the rest of this turn.
+        thinkingSupported = false;
+        response = await getAI().models.generateContent({
+          model,
+          contents: history,
+          config: baseConfig,
+        });
+      }
+    } else {
+      response = await getAI().models.generateContent({
+        model,
+        contents: history,
+        config: baseConfig,
+      });
+    }
 
     const candidate = response.candidates?.[0];
     if (!candidate?.content) break;
@@ -105,12 +137,26 @@ export async function* runAgentLoop(options: RunOptions): AsyncGenerator<AgentEv
     const functionCallParts = parts.filter((p) => p.functionCall);
 
     if (functionCallParts.length === 0) {
+      // Split thought parts from answer parts.
       for (const part of parts) {
-        if (part.text) yield { type: 'chunk', text: part.text };
+        if (!part.text) continue;
+        if ((part as any).thought) {
+          yield { type: 'thought', text: part.text };
+        } else {
+          yield { type: 'chunk', text: part.text };
+        }
       }
       deleteTurn(turnId); // finished cleanly — nothing left to resume
       yield { type: 'done' };
       return;
+    }
+
+    // Tool-call turns can also carry thought parts alongside the function calls —
+    // surface those too, before executing the tools.
+    for (const part of parts) {
+      if (part.text && (part as any).thought) {
+        yield { type: 'thought', text: part.text };
+      }
     }
 
     const toolResultParts: Part[] = [];
